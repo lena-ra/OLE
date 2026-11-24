@@ -54,6 +54,9 @@ class NUTSSampler(Sampler):
         self.M_adapt = self.hyperparameters['M_adapt']
         self.hyperparameters['delta_max'] = 1000 if 'delta_max' not in self.hyperparameters else self.hyperparameters['delta_max']
         self.delta_max = self.hyperparameters['delta_max']
+        # maximum number of re-draws for a sample that lands outside the prior before keeping the previous sample
+        self.hyperparameters['max_prior_retries'] = 100 if 'max_prior_retries' not in self.hyperparameters else self.hyperparameters['max_prior_retries']
+        self.max_prior_retries = self.hyperparameters['max_prior_retries']
 
         # minimize nuisance parameters
         self.hyperparameters['minimize_nuisance_parameters'] = True if 'minimize_nuisance_parameters' not in self.hyperparameters else self.hyperparameters['minimize_nuisance_parameters']
@@ -339,9 +342,10 @@ class NUTSSampler(Sampler):
                 self.write_to_log("NUTS: Start Sampling \n")
 
             valid_point_flag = False # we need to check whether the point is inside the prior
+            n_prior_retries = 0
             while not valid_point_flag:
-            
-                RNG, r, u, logjoint0, loglike0 = self._init_iteration(thetas[i], RNG)
+
+                RNG, r, logu, logjoint0, loglike0 = self._init_iteration(thetas[i], RNG)
 
                 # Initialize the trajectory
                 theta_m, theta_p, r_m, r_p = thetas[i], thetas[i], r, r
@@ -358,9 +362,9 @@ class NUTSSampler(Sampler):
                     
                     # Double the trajectory length in that direction
                     if v == -1:
-                        RNG, theta_m, r_m, _, _, theta_f, n_f, s_f, alpha, n_alpha = self._build_tree(theta_m, r_m, u, v, k, eps, logjoint0, RNG)
+                        RNG, theta_m, r_m, _, _, theta_f, n_f, s_f, alpha, n_alpha = self._build_tree(theta_m, r_m, logu, v, k, eps, logjoint0, RNG)
                     else:
-                        RNG, _, _, theta_p, r_p, theta_f, n_f, s_f, alpha, n_alpha = self._build_tree(theta_p, r_p, u, v, k, eps, logjoint0, RNG)
+                        RNG, _, _, theta_p, r_p, theta_f, n_f, s_f, alpha, n_alpha = self._build_tree(theta_p, r_p, logu, v, k, eps, logjoint0, RNG)
 
                     # Update theta with probability n_f / n, to effectively sample a point from the trajectory;
                     # Update the current length of the trajectory;
@@ -380,7 +384,16 @@ class NUTSSampler(Sampler):
                 check_logprior = self.compute_logprior(parameters_untransformed)
                 if check_logprior > -1e20:
                     valid_point_flag = True
+                elif n_prior_retries >= self.max_prior_retries:
+                    # Without a cap this loop can spin forever, e.g. when the step size is too
+                    # large for the local gradient and every trajectory leaves the prior.
+                    # Treat it as a rejection and stay at the previous sample.
+                    self.warning("Sample %d/%d is still outside the prior after %d retries. Keeping the previous sample."%(i+1, self.M_adapt + nsteps +1, n_prior_retries))
+                    self.write_to_log("NUTS: Sample %d outside the prior after %d retries, keeping previous sample \n"%(i+1, n_prior_retries))
+                    thetas[i+1] = thetas[i]
+                    valid_point_flag = True
                 else:
+                    n_prior_retries += 1
                     self.warning("Sample %d/%d is outside the prior. Sampling again."%(i+1, self.M_adapt + nsteps +1))
 
 
@@ -652,8 +665,8 @@ class NUTSSampler(Sampler):
             The updated PRNG key.
         r : ndarray
             The initial momentum vector.
-        u : float
-            The slice for this iteration.
+        logu : float
+            The logarithm of the slice variable for this iteration.
         logjoint : float
             The logarithm of the joint probability p(theta, r)
         """
@@ -672,8 +685,11 @@ class NUTSSampler(Sampler):
             self.write_to_log(_)
         
         logjoint = logprob - .5 * jnp.dot(r, r)
-        u = random.uniform(subkeys[1]) * jnp.exp(logjoint)
-        return key, r, u, logjoint, logprob
+        # Draw the slice in log space: u = uniform * exp(logjoint) underflows to 0
+        # (log u = -inf) once logjoint < ~-745 (float64), which silently disables
+        # both the slice check and the divergence check in _init_build_tree.
+        logu = logjoint + jnp.log(random.uniform(subkeys[1]))
+        return key, r, logu, logjoint, logprob
 
     # @partial(jax.jit, static_argnums=0)
     def _draw_direction(self, key: ndarray) -> Tuple[ndarray, int]:
@@ -803,7 +819,7 @@ class NUTSSampler(Sampler):
         eps_bar = jnp.exp(mkappa * jnp.log(eps) + (1 - mkappa) * jnp.log(eps_bar))
         return H_bar, eps_bar, eps
 
-    def _build_tree(self, theta: ndarray, r: ndarray, u: float, v: int, j: int, 
+    def _build_tree(self, theta: ndarray, r: ndarray, logu: float, v: int, j: int, 
                    eps: float, logjoint0: ndarray, key: ndarray) -> Tuple[ndarray, 
                    ndarray, ndarray, ndarray, ndarray, ndarray, int, int, float, int]:
         """Recursively build the trajectory binary tree.
@@ -814,8 +830,8 @@ class NUTSSampler(Sampler):
             Sample position.
         r : ndarray
             Sample momentum.
-        u : float
-            Slice position.
+        logu : float
+            Logarithm of the slice position.
         v : int
             Direction to take.
         j : int
@@ -852,14 +868,14 @@ class NUTSSampler(Sampler):
             Total set size.
         """
         if j == 0: # Initialize the tree
-            return self._init_build_tree(theta, r, u, v, j, eps, logjoint0, key)
+            return self._init_build_tree(theta, r, logu, v, j, eps, logjoint0, key)
         else: # Recurse
-            key, theta_m, r_m, theta_p, r_p, theta_f, n_f, s_f, alpha_f, n_alpha_f = self._build_tree(theta, r, u, v, j - 1, eps, logjoint0, key)
+            key, theta_m, r_m, theta_p, r_p, theta_f, n_f, s_f, alpha_f, n_alpha_f = self._build_tree(theta, r, logu, v, j - 1, eps, logjoint0, key)
             if s_f == 1: # If no early stopping, recurse.
                 if v == -1:
-                    key, theta_m, r_m, _, _, theta_ff, n_ff, s_ff, alpha_ff, n_alpha_ff = self._build_tree(theta_m, r_m, u, v, j - 1, eps, logjoint0, key)
+                    key, theta_m, r_m, _, _, theta_ff, n_ff, s_ff, alpha_ff, n_alpha_ff = self._build_tree(theta_m, r_m, logu, v, j - 1, eps, logjoint0, key)
                 else:
-                    key, _, _, theta_p, r_p, theta_ff, n_ff, s_ff, alpha_ff, n_alpha_ff = self._build_tree(theta_p, r_p, u, v, j - 1, eps, logjoint0, key)
+                    key, _, _, theta_p, r_p, theta_ff, n_ff, s_ff, alpha_ff, n_alpha_ff = self._build_tree(theta_p, r_p, logu, v, j - 1, eps, logjoint0, key)
                 
                 # Update theta with probability n_ff / (n_f + n_ff);
                 # Update the stopping indicator (U-turn);
@@ -869,7 +885,7 @@ class NUTSSampler(Sampler):
             return key, theta_m, r_m, theta_p, r_p, theta_f, n_f, s_f, alpha_f, n_alpha_f
 
     # @partial(jax.jit, static_argnums=0)
-    def _init_build_tree(self, theta : ndarray, r : ndarray, u : float, v : int, j : int, 
+    def _init_build_tree(self, theta : ndarray, r : ndarray, logu : float, v : int, j : int, 
                          eps : float, logjoint0 : float, key : ndarray) -> Tuple[ndarray, 
                          ndarray, ndarray, ndarray, ndarray, ndarray, int, int, float, int]:
         """Initialize the trajectory binary tree."""
@@ -877,9 +893,9 @@ class NUTSSampler(Sampler):
         theta, r, logp, _ = self._leapfrog(theta, r, v * eps)
         logjoint = logp - .5 * jnp.dot(r, r)
         # Check if the step is within the slice
-        n_f = (jnp.log(u) <= logjoint).astype(int)
+        n_f = (logu <= logjoint).astype(int)
         # Check that we are not completely off-track
-        s_f = (jnp.log(u) < logjoint + self.delta_max).astype(int)
+        s_f = (logu < logjoint + self.delta_max).astype(int)
         # Compute the acceptance rate
         prob_ratio = jnp.exp(logjoint - logjoint0)  
         alpha_f = lax.cond(jnp.isnan(prob_ratio), lambda _: 0., lambda _: lax.min(prob_ratio, 1.), None) # Presumably if the probability ratio diverges,
